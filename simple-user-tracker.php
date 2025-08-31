@@ -159,45 +159,61 @@ $page_type = null;
 
 
 
-    // Detect categories / tags / taxonomy
-if (is_category() || is_tag() || is_tax()) {
-    $term = get_queried_object();
-    if ($term && isset($term->term_id)) {
-        $page_id   = $term->term_id; // خزّن الـ term_id
-        $page_type = $term->taxonomy; // زي "category" أو "post_tag"
+    // Determine canonical page context (type, id, and URL)
+    if (is_singular()) {
+        $page_type = get_post_type($page_id) ?: 'post';
+        $page_url  = get_permalink($page_id);
+    } elseif (is_category() || is_tag() || is_tax()) {
+        $term = get_queried_object();
+        if ($term && isset($term->term_id)) {
+            $page_id   = $term->term_id;
+            $page_type = $term->taxonomy; // e.g. category, post_tag, custom taxonomy
+            $link      = get_term_link($term);
+            if (!is_wp_error($link)) {
+                $page_url = $link;
+            }
+        }
+    } elseif (is_author()) {
+        $author = get_queried_object();
+        if ($author && isset($author->ID)) {
+            $page_id   = $author->ID;
+            $page_type = 'author';
+            $page_url  = get_author_posts_url($author->ID);
+        }
+    } elseif (is_search()) {
+        $page_type = 'search';
+        $page_url  = function_exists('get_search_link') ? get_search_link() : esc_url_raw(home_url($_SERVER['REQUEST_URI']));
+    } elseif (is_post_type_archive()) {
+        $page_type = 'post_type_archive';
+        $ptype = get_query_var('post_type');
+        if (is_array($ptype)) { $ptype = reset($ptype); }
+        if ($ptype && function_exists('get_post_type_archive_link')) {
+            $link = get_post_type_archive_link($ptype);
+            if ($link) { $page_url = $link; }
+        }
+    } elseif (is_date()) {
+        $page_type = 'date_archive';
+        $year = get_query_var('year');
+        $month = get_query_var('monthnum');
+        $day = get_query_var('day');
+        if ($year && $month && $day) {
+            $page_url = get_day_link((int)$year, (int)$month, (int)$day);
+        } elseif ($year && $month) {
+            $page_url = get_month_link((int)$year, (int)$month);
+        } elseif ($year) {
+            $page_url = get_year_link((int)$year);
+        }
+    } elseif (is_front_page() || is_home()) {
+        $page_type = 'home';
+        $page_url  = home_url('/');
+    } elseif (is_404()) {
+        $page_type = '404';
+        // keep request URL so we can see what was requested
+        $page_url  = esc_url_raw(home_url($_SERVER['REQUEST_URI']));
+    } else {
+        // Fallback to request URL
+        $page_url = esc_url_raw(home_url($_SERVER['REQUEST_URI']));
     }
-}
-
-// Detect search
-elseif (is_search()) {
-    $page_type = 'search';
-}
-
-// Detect author
-elseif (is_author()) {
-    $author = get_queried_object();
-    if ($author && isset($author->ID)) {
-        $page_id   = $author->ID;
-        $page_type = 'author';
-    }
-}
-
-// Default post / page
-elseif (is_singular()) {
-    $page_type = 'post';
-}
-// if($page_url==0){
-    var_dump($page_id);
-    echo"<br/>";
-    var_dump($page_url);
-    echo"<br/>";
-
-    var_dump($_SERVER['REQUEST_URI']);
-    echo"<br/>";
-
-    var_dump(home_url($_SERVER['REQUEST_URI']));
-    // die();
-// }
     // Location via ip-api (lightweight). Timeout small.
     if (filter_var($ip, FILTER_VALIDATE_IP) && !in_array($ip, ['127.0.0.1', '::1', '0.0.0.0'])) {
         $resp = wp_remote_get("http://ip-api.com/json/{$ip}?fields=status,country,regionName,city", ['timeout' => 2]);
@@ -239,7 +255,18 @@ elseif (is_singular()) {
     'is_landing' => $is_landing,
     'visited_at' => current_time('mysql', 1),
 ], [
-    '%d','%s','%s','%s','%s','%s','%d','%s','%s','%d','%s'
+    '%d', // user_id
+    '%s', // device_id
+    '%s', // session_id
+    '%s', // ip
+    '%s', // country
+    '%s', // region
+    '%s', // city
+    '%d', // page_id
+    '%s', // page_type
+    '%s', // page_url
+    '%d', // is_landing
+    '%s'  // visited_at
 ]);
 
 
@@ -324,10 +351,15 @@ function sut_page_visits() {
 
     list($where, $params) = sut_build_where_params_from_get();
 
-    // Export handling (CSV streaming)
-    if (isset($_GET['sut_export']) && $_GET['sut_export'] === 'csv') {
-        sut_export_csv_filtered($where, $params);
-        exit;
+    // Export handling
+    if (isset($_GET['sut_export'])) {
+        if ($_GET['sut_export'] === 'csv') {
+            sut_export_csv_filtered($where, $params);
+            exit;
+        } elseif ($_GET['sut_export'] === 'xlsx') {
+            sut_export_xlsx_filtered($where, $params);
+            exit;
+        }
     }
 
     // pagination
@@ -346,20 +378,17 @@ function sut_page_visits() {
     // fetch page
     $select_sql = "SELECT * FROM {$table} {$where} ORDER BY visited_at DESC LIMIT %d OFFSET %d";
     if (!empty($params)) {
-        $prepare_args = array_merge([$select_sql], $params, [$per_page, $offset]);
-        $rows = call_user_func_array([$wpdb, 'get_results'], $prepare_args);
+        $prepared_select = $wpdb->prepare($select_sql, array_merge($params, [$per_page, $offset]));
     } else {
-        $rows = $wpdb->get_results($wpdb->prepare($select_sql, $per_page, $offset));
+        $prepared_select = $wpdb->prepare($select_sql, $per_page, $offset);
     }
+    $rows = $wpdb->get_results($prepared_select);
 
     // Top pages summary (limit 20)
     $stats_sql = "SELECT page_url, COUNT(*) AS total_visits, SUM(is_landing = 1) AS landing_visits
                   FROM {$table} {$where} GROUP BY page_url ORDER BY total_visits DESC LIMIT 20";
-    if (!empty($params)) {
-        $stats = call_user_func_array([$wpdb, 'get_results'], array_merge([$stats_sql], $params));
-    } else {
-        $stats = $wpdb->get_results($stats_sql);
-    }
+    $prepared_stats = !empty($params) ? $wpdb->prepare($stats_sql, $params) : $stats_sql;
+    $stats = $wpdb->get_results($prepared_stats);
 
     // Render UI
     echo '<div class="wrap"><h1>User Visits</h1>';
@@ -388,7 +417,13 @@ function sut_page_visits() {
     if ($pagefilter) $qs['page_url'] = $pagefilter;
     $base_qs = http_build_query($qs);
 
-    echo '<p><a class="button" href="?page=sut-visits&' . $base_qs . '&sut_export=csv">Export CSV</a></p>';
+    global $SUT_HAS_PHPSPREADSHEET;
+    echo '<p>';
+    echo '<a class="button" href="?page=sut-visits&' . $base_qs . '&sut_export=csv">Export CSV</a> ';
+    if (!empty($SUT_HAS_PHPSPREADSHEET)) {
+        echo '<a class="button" href="?page=sut-visits&' . $base_qs . '&sut_export=xlsx">Export XLSX</a>';
+    }
+    echo '</p>';
 
     // Top pages
     echo '<h2>Top Pages (by visits)</h2>';
@@ -469,11 +504,7 @@ function sut_export_csv_filtered($where, $params) {
 
     // build ids list to chunk
     $ids_sql = "SELECT id FROM {$table} {$where} ORDER BY visited_at DESC";
-    if (!empty($params)) {
-        $ids_query = call_user_func_array([$wpdb, 'prepare'], array_merge([$ids_sql], $params));
-    } else {
-        $ids_query = $ids_sql;
-    }
+    $ids_query = !empty($params) ? $wpdb->prepare($ids_sql, $params) : $ids_sql;
     $all_ids = $wpdb->get_col($ids_query);
 
     @set_time_limit(0);
@@ -488,7 +519,7 @@ function sut_export_csv_filtered($where, $params) {
     fputcsv($out, ['ID','User','Device','Session','IP','Country','Region','City','Page','IsLanding','Visited At']);
 
     if (!empty($all_ids)) {
-        $chunk_size = 2000;
+        $chunk_size = 5000; // larger chunks, but still memory-safe
         $chunks = array_chunk($all_ids, $chunk_size);
         foreach ($chunks as $chunk) {
             $in = implode(',', array_map('intval', $chunk));
@@ -659,14 +690,84 @@ function sut_page_troubleshoot() {
 }
 
 /* =======================
-   Excel Export: COMMENTED OUT for now (kept for future)
-   =======================
-use PhpOffice\PhpSpreadsheet\Spreadsheet;
-use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+   Excel Export (XLSX) with memory optimizations
+   ======================= */
+if (!function_exists('sut_export_xlsx_filtered')) {
+    function sut_export_xlsx_filtered($where, $params) {
+        global $wpdb, $SUT_HAS_PHPSPREADSHEET;
+        if (empty($SUT_HAS_PHPSPREADSHEET)) {
+            wp_die('XLSX export requires PhpSpreadsheet.');
+        }
 
-function sut_export_excel_chunked($where, $params) {
-    // commented - placeholder
+        // Lazy-load classes to avoid autoload overhead when not used
+        $Spreadsheet = '\\PhpOffice\\PhpSpreadsheet\\Spreadsheet';
+        $WriterXlsx  = '\\PhpOffice\\PhpSpreadsheet\\Writer\\Xlsx';
+        $Settings    = '\\PhpOffice\\PhpSpreadsheet\\Settings';
+        $MemoryCache = '\\PhpOffice\\PhpSpreadsheet\\Collection\\Memory\\SimpleCache3';
+
+        // Prefer memory-efficient cache
+        if (class_exists($Settings) && class_exists($MemoryCache)) {
+            $Settings::setCache(new $MemoryCache());
+        }
+
+        $table = $wpdb->prefix . 'user_visits';
+
+        // Collect IDs first (so we can stream in chunks)
+        $ids_sql = "SELECT id FROM {$table} {$where} ORDER BY visited_at DESC";
+        $ids_query = !empty($params) ? $wpdb->prepare($ids_sql, $params) : $ids_sql;
+        $all_ids = $wpdb->get_col($ids_query);
+
+        // Prepare spreadsheet
+        $spreadsheet = new $Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('User Visits');
+        $headers = ['ID','User','Device','Session','IP','Country','Region','City','Page','IsLanding','Visited At'];
+        $colIndex = 1; // 1-based
+        foreach ($headers as $h) {
+            $sheet->setCellValueByColumnAndRow($colIndex++, 1, $h);
+        }
+
+        $rowIndex = 2;
+        if (!empty($all_ids)) {
+            $chunk_size = 5000;
+            $chunks = array_chunk($all_ids, $chunk_size);
+            foreach ($chunks as $chunk) {
+                $in = implode(',', array_map('intval', $chunk));
+                $rows = $wpdb->get_results("SELECT * FROM {$table} WHERE id IN ({$in}) ORDER BY visited_at DESC", ARRAY_A);
+                foreach ($rows as $r) {
+                    $colIndex = 1;
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, (int)$r['id']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['user_id'] ?: 'Guest');
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['device_id']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['session_id']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['ip']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['country']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['region']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['city']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['page_url']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, (int)$r['is_landing']);
+                    $sheet->setCellValueByColumnAndRow($colIndex++, $rowIndex, $r['visited_at']);
+                    $rowIndex++;
+                }
+                if (function_exists('gc_collect_cycles')) gc_collect_cycles();
+            }
+        }
+
+        // Stream to browser
+        @set_time_limit(0);
+        if (function_exists('ob_get_level')) {
+            while (ob_get_level()) ob_end_clean();
+        }
+        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        header('Content-Disposition: attachment; filename="user_visits.xlsx"');
+        header('Cache-Control: max-age=0');
+
+        $writer = new $WriterXlsx($spreadsheet);
+        // Write directly to output stream to avoid buffering
+        $writer->save('php://output');
+        if (function_exists('gc_collect_cycles')) gc_collect_cycles();
+        exit;
+    }
 }
-*/
 
 /* End of plugin file */
