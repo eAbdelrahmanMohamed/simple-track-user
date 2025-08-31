@@ -159,45 +159,61 @@ $page_type = null;
 
 
 
-    // Detect categories / tags / taxonomy
-if (is_category() || is_tag() || is_tax()) {
-    $term = get_queried_object();
-    if ($term && isset($term->term_id)) {
-        $page_id   = $term->term_id; // خزّن الـ term_id
-        $page_type = $term->taxonomy; // زي "category" أو "post_tag"
+    // Determine canonical page context (type, id, and URL)
+    if (is_singular()) {
+        $page_type = get_post_type($page_id) ?: 'post';
+        $page_url  = get_permalink($page_id);
+    } elseif (is_category() || is_tag() || is_tax()) {
+        $term = get_queried_object();
+        if ($term && isset($term->term_id)) {
+            $page_id   = $term->term_id;
+            $page_type = $term->taxonomy; // e.g. category, post_tag, custom taxonomy
+            $link      = get_term_link($term);
+            if (!is_wp_error($link)) {
+                $page_url = $link;
+            }
+        }
+    } elseif (is_author()) {
+        $author = get_queried_object();
+        if ($author && isset($author->ID)) {
+            $page_id   = $author->ID;
+            $page_type = 'author';
+            $page_url  = get_author_posts_url($author->ID);
+        }
+    } elseif (is_search()) {
+        $page_type = 'search';
+        $page_url  = function_exists('get_search_link') ? get_search_link() : esc_url_raw(home_url($_SERVER['REQUEST_URI']));
+    } elseif (is_post_type_archive()) {
+        $page_type = 'post_type_archive';
+        $ptype = get_query_var('post_type');
+        if (is_array($ptype)) { $ptype = reset($ptype); }
+        if ($ptype && function_exists('get_post_type_archive_link')) {
+            $link = get_post_type_archive_link($ptype);
+            if ($link) { $page_url = $link; }
+        }
+    } elseif (is_date()) {
+        $page_type = 'date_archive';
+        $year = get_query_var('year');
+        $month = get_query_var('monthnum');
+        $day = get_query_var('day');
+        if ($year && $month && $day) {
+            $page_url = get_day_link((int)$year, (int)$month, (int)$day);
+        } elseif ($year && $month) {
+            $page_url = get_month_link((int)$year, (int)$month);
+        } elseif ($year) {
+            $page_url = get_year_link((int)$year);
+        }
+    } elseif (is_front_page() || is_home()) {
+        $page_type = 'home';
+        $page_url  = home_url('/');
+    } elseif (is_404()) {
+        $page_type = '404';
+        // keep request URL so we can see what was requested
+        $page_url  = esc_url_raw(home_url($_SERVER['REQUEST_URI']));
+    } else {
+        // Fallback to request URL
+        $page_url = esc_url_raw(home_url($_SERVER['REQUEST_URI']));
     }
-}
-
-// Detect search
-elseif (is_search()) {
-    $page_type = 'search';
-}
-
-// Detect author
-elseif (is_author()) {
-    $author = get_queried_object();
-    if ($author && isset($author->ID)) {
-        $page_id   = $author->ID;
-        $page_type = 'author';
-    }
-}
-
-// Default post / page
-elseif (is_singular()) {
-    $page_type = 'post';
-}
-// if($page_url==0){
-    var_dump($page_id);
-    echo"<br/>";
-    var_dump($page_url);
-    echo"<br/>";
-
-    var_dump($_SERVER['REQUEST_URI']);
-    echo"<br/>";
-
-    var_dump(home_url($_SERVER['REQUEST_URI']));
-    // die();
-// }
     // Location via ip-api (lightweight). Timeout small.
     if (filter_var($ip, FILTER_VALIDATE_IP) && !in_array($ip, ['127.0.0.1', '::1', '0.0.0.0'])) {
         $resp = wp_remote_get("http://ip-api.com/json/{$ip}?fields=status,country,regionName,city", ['timeout' => 2]);
@@ -239,7 +255,18 @@ elseif (is_singular()) {
     'is_landing' => $is_landing,
     'visited_at' => current_time('mysql', 1),
 ], [
-    '%d','%s','%s','%s','%s','%s','%d','%s','%s','%d','%s'
+    '%d', // user_id
+    '%s', // device_id
+    '%s', // session_id
+    '%s', // ip
+    '%s', // country
+    '%s', // region
+    '%s', // city
+    '%d', // page_id
+    '%s', // page_type
+    '%s', // page_url
+    '%d', // is_landing
+    '%s'  // visited_at
 ]);
 
 
