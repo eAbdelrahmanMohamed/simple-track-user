@@ -1,0 +1,672 @@
+<?php
+/**
+ * Plugin Name: Simple User Tracker
+ * Description: Track user visits with device/session/location + admin reports + CSV export + troubleshooting + pages stats (daily) + optimized.
+ * Version: 1.5
+ * Author: Abd El Rahman
+ */
+
+if (!defined('ABSPATH')) exit;
+
+/* -------------------------
+   Config
+------------------------- */
+define('SUT_PLUGIN_DIR', plugin_dir_path(__FILE__));
+define('SUT_PLUGIN_URL', plugin_dir_url(__FILE__));
+
+/* -------------------------
+   Autoload (PhpSpreadsheet optional)
+------------------------- */
+$SUT_VENDOR = __DIR__ . '/vendor/autoload.php';
+$SUT_HAS_PHPSPREADSHEET = false;
+if (file_exists($SUT_VENDOR)) {
+    require_once $SUT_VENDOR;
+    if (class_exists('\PhpOffice\PhpSpreadsheet\Spreadsheet')) {
+        $SUT_HAS_PHPSPREADSHEET = true;
+    }
+}
+
+
+/* =======================
+   Activation / Uninstall
+   ======================= */
+function sut_activate_plugin() {
+    global $wpdb;
+    $charset_collate = $wpdb->get_charset_collate();
+    $visits = $wpdb->prefix . 'user_visits';
+    $logs   = $wpdb->prefix . 'sut_logs';
+
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+    // visits table includes session_id and is_landing
+    $sql1 = "CREATE TABLE {$visits} (
+        id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT(20) UNSIGNED NULL,
+        device_id VARCHAR(64) NULL,
+        session_id VARCHAR(64) NULL,
+        ip VARCHAR(45) NULL,
+        country VARCHAR(100) NULL,
+        region VARCHAR(100) NULL,
+        city VARCHAR(100) NULL,
+        page_id BIGINT(20) NULL,
+        page_url TEXT NULL,
+        page_type VARCHAR(50) NULL,
+
+        is_landing TINYINT(1) DEFAULT 0,
+        visited_at DATETIME(6) NOT NULL,
+        PRIMARY KEY (id),
+        INDEX (user_id),
+        INDEX (device_id),
+        INDEX (session_id),
+        INDEX (page_id),
+        INDEX (ip),
+        INDEX (visited_at)
+    ) {$charset_collate};";
+
+    $sql2 = "CREATE TABLE {$logs} (
+        id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+        message TEXT NOT NULL,
+        created_at DATETIME(6) NOT NULL,
+        PRIMARY KEY (id),
+        INDEX (created_at)
+    ) {$charset_collate};";
+
+    dbDelta($sql1);
+    dbDelta($sql2);
+
+}
+register_activation_hook(__FILE__, 'sut_activate_plugin');
+
+function sut_uninstall_plugin() {
+    global $wpdb;
+    $visits = $wpdb->prefix . 'user_visits';
+    $logs   = $wpdb->prefix . 'sut_logs';
+    $wpdb->query("DROP TABLE IF EXISTS {$visits}");
+    $wpdb->query("DROP TABLE IF EXISTS {$logs}");
+}
+register_uninstall_hook(__FILE__, 'sut_uninstall_plugin');
+
+/* =======================
+   Logging helper
+   ======================= */
+function sut_log($msg) {
+    global $wpdb;
+    $table = $wpdb->prefix . 'sut_logs';
+    $wpdb->insert($table, [
+        'message' => is_scalar($msg) ? $msg : wp_json_encode($msg),
+        'created_at' => current_time('mysql', 1)
+    ], ['%s', '%s']);
+}
+
+/* =======================
+   Enqueue tracker.js (creates device_id & session_id cookies)
+   ======================= */
+add_action('wp_enqueue_scripts', 'sut_enqueue_device_js');
+function sut_enqueue_device_js() {
+    wp_enqueue_script('sut-track', SUT_PLUGIN_URL . 'includes/tracker.js', [], '1.0', true);
+}
+
+/* -------------------------
+   includes/tracker.js (create this file in plugin includes/ folder)
+   Content (JS) — put in includes/tracker.js:
+--------------------------------------------------
+(function () {
+    function getCookie(n) {
+        var v = document.cookie.match('(^|;) ?' + n + '=([^;]*)(;|$)');
+        return v ? v[2] : null;
+    }
+    function gen() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            var r = Math.random() * 16 | 0,
+                v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+    // device_id persistent (1 year)
+    if (!getCookie('sut_device_id')) {
+        document.cookie = 'sut_device_id=' + gen() + ';path=/;max-age=' + (60 * 60 * 24 * 365);
+    }
+    // session_id (30 minutes)
+    if (!getCookie('sut_session_id')) {
+        document.cookie = 'sut_session_id=' + gen() + ';path=/;max-age=' + (30 * 60);
+    }
+})();
+--------------------------------------------------
+(End file)
+------------------------- */
+
+/* =======================
+   Tracking (template_redirect)
+   - records device_id, session_id, ip, location, page, is_landing
+   - is_landing: first visit for device_id
+   ======================= */
+add_action('template_redirect', 'sut_track_visit');
+function sut_track_visit() {
+    if (is_admin()) return;
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'user_visits';
+
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    $page_url = esc_url_raw(home_url($_SERVER['REQUEST_URI']));
+    $user_id = get_current_user_id() ?: null;
+    $page_id = get_queried_object_id() ?: null;
+    $device_id = isset($_COOKIE['sut_device_id']) ? sanitize_text_field($_COOKIE['sut_device_id']) : null;
+    $session_id = isset($_COOKIE['sut_session_id']) ? sanitize_text_field($_COOKIE['sut_session_id']) : null;
+$page_type = null;
+
+    $country = $region = $city = null;
+
+
+
+    // Detect categories / tags / taxonomy
+if (is_category() || is_tag() || is_tax()) {
+    $term = get_queried_object();
+    if ($term && isset($term->term_id)) {
+        $page_id   = $term->term_id; // خزّن الـ term_id
+        $page_type = $term->taxonomy; // زي "category" أو "post_tag"
+    }
+}
+
+// Detect search
+elseif (is_search()) {
+    $page_type = 'search';
+}
+
+// Detect author
+elseif (is_author()) {
+    $author = get_queried_object();
+    if ($author && isset($author->ID)) {
+        $page_id   = $author->ID;
+        $page_type = 'author';
+    }
+}
+
+// Default post / page
+elseif (is_singular()) {
+    $page_type = 'post';
+}
+// if($page_url==0){
+    var_dump($page_id);
+    echo"<br/>";
+    var_dump($page_url);
+    echo"<br/>";
+
+    var_dump($_SERVER['REQUEST_URI']);
+    echo"<br/>";
+
+    var_dump(home_url($_SERVER['REQUEST_URI']));
+    // die();
+// }
+    // Location via ip-api (lightweight). Timeout small.
+    if (filter_var($ip, FILTER_VALIDATE_IP) && !in_array($ip, ['127.0.0.1', '::1', '0.0.0.0'])) {
+        $resp = wp_remote_get("http://ip-api.com/json/{$ip}?fields=status,country,regionName,city", ['timeout' => 2]);
+        if (is_wp_error($resp)) {
+            sut_log('wp_remote_get error for ip-api: ' . $resp->get_error_message());
+        } else {
+            $body = wp_remote_retrieve_body($resp);
+            $data = @json_decode($body);
+            if ($data && isset($data->status) && $data->status === 'success') {
+                $country = isset($data->country) ? sanitize_text_field($data->country) : null;
+                $region  = isset($data->regionName) ? sanitize_text_field($data->regionName) : null;
+                $city    = isset($data->city) ? sanitize_text_field($data->city) : null;
+            } else {
+                sut_log('ip-api returned non-success for IP ' . $ip . ' raw: ' . substr($body, 0, 400));
+            }
+        }
+    }
+
+    // Determine is_landing: first ever visit for this device_id
+    $is_landing = 0;
+    if ($device_id) {
+        $cnt = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$table} WHERE device_id = %s", $device_id));
+ 
+        if (intval($cnt) === 0) $is_landing = 1;
+    }
+    
+
+   $inserted = $wpdb->insert($table, [
+    'user_id'    => $user_id,
+    'device_id'  => $device_id,
+    'session_id' => $session_id,
+    'ip'         => $ip,
+    'country'    => $country,
+    'region'     => $region,
+    'city'       => $city,
+    'page_id'    => $page_id,
+    'page_type'  => $page_type,
+    'page_url'   => $page_url,
+    'is_landing' => $is_landing,
+    'visited_at' => current_time('mysql', 1),
+], [
+    '%d','%s','%s','%s','%s','%s','%d','%s','%s','%d','%s'
+]);
+
+
+
+    if ($inserted === false) {
+        sut_log('DB insert failed: ' . $wpdb->last_error);
+    }
+}
+function sut_get_page_label($row) {
+    switch ($row->page_type) {
+        case 'category':
+        case 'post_tag':
+        case 'taxonomy':
+            $term = get_term($row->page_id, $row->page_type);
+            return $term ? ucfirst($row->page_type) . ': ' . $term->name : $row->page_url;
+
+        case 'author':
+            $user = get_userdata($row->page_id);
+            return $user ? 'Author: ' . $user->display_name : $row->page_url;
+
+        case 'search':
+            return 'Search Results';
+
+        case 'post':
+        default:
+            return get_the_title($row->page_id) ?: $row->page_url;
+    }
+}
+
+/* =======================
+   Admin pages (menu)
+   ======================= */
+add_action('admin_menu', 'sut_admin_menu');
+function sut_admin_menu() {
+    add_menu_page('User Tracker', 'User Tracker', 'manage_options', 'sut-main', 'sut_page_visits', 'dashicons-chart-area', 60);
+    add_submenu_page('sut-main', 'Visits', 'Visits', 'manage_options', 'sut-visits', 'sut_page_visits');
+    add_submenu_page('sut-main', 'Pages Stats', 'Pages Stats', 'manage_options', 'sut-pages-stats', 'sut_page_pages_stats');
+    add_submenu_page('sut-main', 'Troubleshoot', 'Troubleshoot', 'manage_options', 'sut-troubleshoot', 'sut_page_troubleshoot');
+}
+
+/* =======================
+   Helper: build where & params from GET for visits page
+   Returns array(where_sql, params_array)
+   ======================= */
+function sut_build_where_params_from_get() {
+    global $wpdb;
+    $where = "WHERE 1=1";
+    $params = [];
+
+    if (!empty($_GET['search'])) {
+        $s = sanitize_text_field(wp_unslash($_GET['search']));
+        $like = '%' . $wpdb->esc_like($s) . '%';
+        $where .= " AND (ip LIKE %s OR device_id LIKE %s OR page_url LIKE %s)";
+        $params[] = $like; $params[] = $like; $params[] = $like;
+    }
+    if (!empty($_GET['from'])) {
+        $from = sanitize_text_field($_GET['from']) . ' 00:00:00';
+        $where .= " AND visited_at >= %s";
+        $params[] = $from;
+    }
+    if (!empty($_GET['to'])) {
+        $to = sanitize_text_field($_GET['to']) . ' 23:59:59';
+        $where .= " AND visited_at <= %s";
+        $params[] = $to;
+    }
+    if (!empty($_GET['page_url'])) {
+        $p = sanitize_text_field(wp_unslash($_GET['page_url']));
+        $likep = '%' . $wpdb->esc_like($p) . '%';
+        $where .= " AND page_url LIKE %s";
+        $params[] = $likep;
+    }
+
+    return [$where, $params];
+}
+
+/* =======================
+   Visits Page: search/filter/pagination/export CSV
+   ======================= */
+function sut_page_visits() {
+    global $wpdb;
+    $table = $wpdb->prefix . 'user_visits';
+
+    list($where, $params) = sut_build_where_params_from_get();
+
+    // Export handling (CSV streaming)
+    if (isset($_GET['sut_export']) && $_GET['sut_export'] === 'csv') {
+        sut_export_csv_filtered($where, $params);
+        exit;
+    }
+
+    // pagination
+    $per_page = 20;
+    $paged = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
+    $offset = ($paged - 1) * $per_page;
+
+    // count total (prepare)
+    if (!empty($params)) {
+        $count_sql = call_user_func_array([$wpdb, 'prepare'], array_merge(["SELECT COUNT(*) FROM {$table} {$where}"], $params));
+        $total = intval($wpdb->get_var($count_sql));
+    } else {
+        $total = intval($wpdb->get_var("SELECT COUNT(*) FROM {$table} {$where}"));
+    }
+
+    // fetch page
+    $select_sql = "SELECT * FROM {$table} {$where} ORDER BY visited_at DESC LIMIT %d OFFSET %d";
+    if (!empty($params)) {
+        $prepare_args = array_merge([$select_sql], $params, [$per_page, $offset]);
+        $rows = call_user_func_array([$wpdb, 'get_results'], $prepare_args);
+    } else {
+        $rows = $wpdb->get_results($wpdb->prepare($select_sql, $per_page, $offset));
+    }
+
+    // Top pages summary (limit 20)
+    $stats_sql = "SELECT page_url, COUNT(*) AS total_visits, SUM(is_landing = 1) AS landing_visits
+                  FROM {$table} {$where} GROUP BY page_url ORDER BY total_visits DESC LIMIT 20";
+    if (!empty($params)) {
+        $stats = call_user_func_array([$wpdb, 'get_results'], array_merge([$stats_sql], $params));
+    } else {
+        $stats = $wpdb->get_results($stats_sql);
+    }
+
+    // Render UI
+    echo '<div class="wrap"><h1>User Visits</h1>';
+
+    // filter form
+    $search_val = isset($_GET['search']) ? esc_attr(sanitize_text_field(wp_unslash($_GET['search']))) : '';
+    $from_val = isset($_GET['from']) ? esc_attr(sanitize_text_field($_GET['from'])) : '';
+    $to_val = isset($_GET['to']) ? esc_attr(sanitize_text_field($_GET['to'])) : '';
+    $pagefilter = isset($_GET['page_url']) ? esc_attr(sanitize_text_field(wp_unslash($_GET['page_url']))) : '';
+
+    echo '<form method="get" style="margin-bottom:12px;">';
+    echo '<input type="hidden" name="page" value="sut-visits" />';
+    echo '<input style="width:260px;margin-right:6px;" type="text" name="search" placeholder="Search IP / Device / Page" value="' . $search_val . '" /> ';
+    echo 'From: <input type="date" name="from" value="' . $from_val . '" /> ';
+    echo 'To: <input type="date" name="to" value="' . $to_val . '" /> ';
+    echo 'Page: <input style="width:300px;margin-left:6px;" type="text" name="page_url" value="' . $pagefilter . '" /> ';
+    echo '<input type="submit" class="button" value="Filter" /> ';
+    echo '<a class="button" href="?page=sut-visits">Reset</a>';
+    echo '</form>';
+
+    // export buttons
+    $qs = [];
+    if ($search_val) $qs['search'] = $search_val;
+    if ($from_val) $qs['from'] = $from_val;
+    if ($to_val) $qs['to'] = $to_val;
+    if ($pagefilter) $qs['page_url'] = $pagefilter;
+    $base_qs = http_build_query($qs);
+
+    echo '<p><a class="button" href="?page=sut-visits&' . $base_qs . '&sut_export=csv">Export CSV</a></p>';
+
+    // Top pages
+    echo '<h2>Top Pages (by visits)</h2>';
+    echo '<table class="widefat striped"><thead><tr><th>Page</th><th>Total</th><th>Landings</th></tr></thead><tbody>';
+    if ($stats) {
+        foreach ($stats as $st) {
+            $title = '';
+            // try find post title if page_id known in another row — optional (we only have page_url here)
+            echo '<tr><td><a href="' . esc_url($st->page_url) . '" target="_blank">' . esc_html($st->page_url) . '</a></td><td>' . esc_html($st->total_visits) . '</td><td>' . esc_html($st->landing_visits) . '</td></tr>';
+        }
+    } else {
+        echo '<tr><td colspan="3">No data</td></tr>';
+    }
+    echo '</tbody></table><br/>';
+
+    // Raw visits table
+    echo '<h2>Raw Visits</h2>';
+    echo '<table class="widefat striped"><thead><tr>
+        <th>ID</th><th>User</th><th>Device</th><th>Session</th><th>IP</th><th>Country</th><th>Region</th><th>City</th><th>Page</th><th>Landing</th><th>Visited At (GMT)</th>
+    </tr></thead><tbody>';
+    if ($rows) {
+        foreach ($rows as $row) {
+            $user = $row->user_id ? esc_html(get_userdata($row->user_id)->user_login) : 'Guest';
+            // $page_title = $row->page_id ? get_the_title($row->page_id) : $row->page_id get_term_by('id', $value, 'category')->name ?: $row->page_url;
+            $page_title = sut_get_page_label($row);
+
+            echo '<tr>';
+            echo '<td>' . esc_html($row->id) . '</td>';
+            echo '<td>' . $user . '</td>';
+            echo '<td>' . esc_html($row->device_id) . '</td>';
+            echo '<td>' . esc_html($row->session_id) . '</td>';
+            echo '<td>' . esc_html($row->ip) . '</td>';
+            echo '<td>' . esc_html($row->country) . '</td>';
+            echo '<td>' . esc_html($row->region) . '</td>';
+            echo '<td>' . esc_html($row->city) . '</td>';
+            // echo '<td><a href="' . esc_url($row->page_url) . '" target="_blank">' . esc_html($page_title) . '</a><br/><small>' . esc_html($row->page_url) . '</small></td>';
+            echo '<td><a href="' . esc_url($row->page_url) . '" target="_blank">' . esc_html($page_title) . '</a><br/><small>' . esc_html($row->page_url) . '</small></td>';
+
+            echo '<td>' . ($row->is_landing ? 'Yes' : 'No') . '</td>';
+            echo '<td>' . esc_html($row->visited_at) . '</td>';
+            echo '</tr>';
+        }
+    } else {
+        echo '<tr><td colspan="11">No visits found for this filter.</td></tr>';
+    }
+    echo '</tbody></table>';
+
+    // Pagination UI (compact)
+    $total_pages = max(1, ceil($total / $per_page));
+    if ($total_pages > 1) {
+        echo '<div class="tablenav"><div class="tablenav-pages">';
+        $base_link = '?page=sut-visits';
+        if ($search_val) $base_link .= '&search=' . urlencode($search_val);
+        if ($from_val) $base_link .= '&from=' . urlencode($from_val);
+        if ($to_val) $base_link .= '&to=' . urlencode($to_val);
+        if ($pagefilter) $base_link .= '&page_url=' . urlencode($pagefilter);
+
+        if ($paged > 1) echo '<a class="button" href="' . esc_url($base_link . '&paged=' . ($paged - 1)) . '">&laquo; Prev</a> ';
+        $start = max(1, $paged - 3);
+        $end = min($total_pages, $paged + 3);
+        for ($i = $start; $i <= $end; $i++) {
+            $style = $i === $paged ? 'style="font-weight:bold;background:#f1f1f1;padding:4px 8px;border-radius:3px;"' : '';
+            echo '<a ' . $style . ' href="' . esc_url($base_link . '&paged=' . $i) . '">' . $i . '</a> ';
+        }
+        if ($paged < $total_pages) echo '<a class="button" href="' . esc_url($base_link . '&paged=' . ($paged + 1)) . '">Next &raquo;</a>';
+        echo '</div></div>';
+    }
+
+    echo '</div>'; // wrap
+}
+
+/* =======================
+   CSV Export for filtered visits (streamed, chunked)
+   ======================= */
+function sut_export_csv_filtered($where, $params) {
+    global $wpdb;
+    $table = $wpdb->prefix . 'user_visits';
+
+    // build ids list to chunk
+    $ids_sql = "SELECT id FROM {$table} {$where} ORDER BY visited_at DESC";
+    if (!empty($params)) {
+        $ids_query = call_user_func_array([$wpdb, 'prepare'], array_merge([$ids_sql], $params));
+    } else {
+        $ids_query = $ids_sql;
+    }
+    $all_ids = $wpdb->get_col($ids_query);
+
+    @set_time_limit(0);
+    if (function_exists('ob_get_level')) {
+        while (ob_get_level()) ob_end_clean();
+    }
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="user_visits.csv"');
+
+    $out = fopen('php://output', 'w');
+    echo "\xEF\xBB\xBF"; // BOM
+    fputcsv($out, ['ID','User','Device','Session','IP','Country','Region','City','Page','IsLanding','Visited At']);
+
+    if (!empty($all_ids)) {
+        $chunk_size = 2000;
+        $chunks = array_chunk($all_ids, $chunk_size);
+        foreach ($chunks as $chunk) {
+            $in = implode(',', array_map('intval', $chunk));
+            $rows = $wpdb->get_results("SELECT * FROM {$table} WHERE id IN ({$in}) ORDER BY visited_at DESC", ARRAY_A);
+            foreach ($rows as $r) {
+                fputcsv($out, [
+                    $r['id'],
+                    $r['user_id'] ?: 'Guest',
+                    $r['device_id'],
+                    $r['session_id'],
+                    $r['ip'],
+                    $r['country'],
+                    $r['region'],
+                    $r['city'],
+                    $r['page_url'],
+                    $r['is_landing'],
+                    $r['visited_at'],
+                ]);
+            }
+            if (function_exists('gc_collect_cycles')) gc_collect_cycles();
+            flush();
+        }
+    }
+    fclose($out);
+    exit;
+}
+
+/* =======================
+   Pages Stats Page
+   - shows pages with total visits in selected date range
+   - for a selected page_url shows daily breakdown
+   ======================= */
+function sut_page_pages_stats() {
+    global $wpdb;
+    $table = $wpdb->prefix . 'user_visits';
+
+    // date range inputs
+    $from = isset($_GET['from']) ? sanitize_text_field($_GET['from']) : '';
+    $to = isset($_GET['to']) ? sanitize_text_field($_GET['to']) : '';
+
+    // selected page (page_url)
+    $selected_page = isset($_GET['page_url']) ? sanitize_text_field(wp_unslash($_GET['page_url'])) : '';
+
+    // build where for date range
+    $where_date = "WHERE 1=1";
+    $params = [];
+    if ($from) { $where_date .= " AND visited_at >= %s"; $params[] = $from . ' 00:00:00'; }
+    if ($to)   { $where_date .= " AND visited_at <= %s"; $params[] = $to . ' 23:59:59'; }
+
+    // pages list: total visits & landing visits in range
+    if (!empty($params)) {
+        $pages_sql = call_user_func_array([$wpdb, 'prepare'], array_merge(["SELECT page_url, COUNT(*) as total_visits, SUM(is_landing=1) as landing_visits FROM {$table} {$where_date} GROUP BY page_url ORDER BY total_visits DESC LIMIT 200"], $params));
+        $pages = $wpdb->get_results($pages_sql);
+    } else {
+        $pages = $wpdb->get_results("SELECT page_url, COUNT(*) as total_visits, SUM(is_landing=1) as landing_visits FROM {$table} {$where_date} GROUP BY page_url ORDER BY total_visits DESC LIMIT 200");
+    }
+
+    echo '<div class="wrap"><h1>Pages Stats</h1>';
+    echo '<form method="get" style="margin-bottom:12px;">';
+    echo '<input type="hidden" name="page" value="sut-pages-stats" />';
+    echo 'From: <input type="date" name="from" value="' . esc_attr($from) . '" /> ';
+    echo 'To: <input type="date" name="to" value="' . esc_attr($to) . '" /> ';
+    echo 'Page filter (URL contains): <input style="width:300px;" type="text" name="page_url" value="' . esc_attr($selected_page) . '" /> ';
+    echo '<input class="button" type="submit" value="Apply" /> ';
+    echo '<a class="button" href="?page=sut-pages-stats">Reset</a>';
+    echo '</form>';
+
+    // show top pages table
+    echo '<h2>Pages (Top 200 by visits in range)</h2>';
+    echo '<table class="widefat striped"><thead><tr><th>Page URL</th><th>Total Visits</th><th>Landing Visits</th></tr></thead><tbody>';
+    if ($pages) {
+        foreach ($pages as $p) {
+            // if page filter present, skip others (we already applied range only; for contains filter, apply below)
+            if ($selected_page && stripos($p->page_url, $selected_page) === false) continue;
+            echo '<tr><td><a href="' . esc_url($p->page_url) . '" target="_blank">' . esc_html($p->page_url) . '</a></td><td>' . esc_html($p->total_visits) . '</td><td>' . esc_html($p->landing_visits) . '</td></tr>';
+        }
+    } else {
+        echo '<tr><td colspan="3">No pages in selected range.</td></tr>';
+    }
+    echo '</tbody></table><br/>';
+
+    // If a specific page selected, show daily breakdown
+    if (!empty($selected_page)) {
+        // decide params for daily aggregation
+        $daily_where = "WHERE page_url LIKE %s";
+        $daily_params = ['%' . $wpdb->esc_like($selected_page) . '%'];
+        if ($from) { $daily_where .= " AND visited_at >= %s"; $daily_params[] = $from . ' 00:00:00'; }
+        if ($to)   { $daily_where .= " AND visited_at <= %s"; $daily_params[] = $to . ' 23:59:59'; }
+
+        $daily_sql = "SELECT DATE(visited_at) as day, COUNT(*) as visits, SUM(is_landing=1) as landings
+                      FROM {$table} {$daily_where}
+                      GROUP BY DATE(visited_at)
+                      ORDER BY DATE(visited_at) DESC";
+
+        $daily_query = call_user_func_array([$wpdb, 'prepare'], array_merge([$daily_sql], $daily_params));
+        $daily = $wpdb->get_results($daily_query);
+
+        echo '<h2>Daily Breakdown for: <code>' . esc_html($selected_page) . '</code></h2>';
+        echo '<table class="widefat striped"><thead><tr><th>Date</th><th>Visits</th><th>Landings</th></tr></thead><tbody>';
+        if ($daily) {
+            foreach ($daily as $d) {
+                echo '<tr><td>' . esc_html($d->day) . '</td><td>' . esc_html($d->visits) . '</td><td>' . esc_html($d->landings) . '</td></tr>';
+            }
+        } else {
+            echo '<tr><td colspan="3">No data for this page in the selected range.</td></tr>';
+        }
+        echo '</tbody></table>';
+    }
+
+    echo '</div>';
+}
+
+/* =======================
+   Troubleshoot page: logs + test insertion
+   ======================= */
+function sut_page_troubleshoot() {
+    global $wpdb;
+    $table = $wpdb->prefix . 'sut_logs';
+
+    echo '<div class="wrap"><h1>Troubleshoot</h1>';
+
+    if (isset($_POST['sut_clear_logs']) && current_user_can('manage_options')) {
+        $wpdb->query("TRUNCATE TABLE {$table}");
+        echo '<div class="updated"><p>Logs cleared.</p></div>';
+    }
+
+    // Test insert button - insert a fake visit row to verify tracking DB write (this is optional)
+    if (isset($_POST['sut_test_visit']) && current_user_can('manage_options')) {
+        $visits = $wpdb->prefix . 'user_visits';
+        $wpdb->insert($visits, [
+            'user_id' => null,
+            'device_id' => 'TEST-DEVICE',
+            'session_id' => 'TEST-SESSION',
+            'ip' => '127.0.0.1',
+            'country' => 'Testland',
+            'region' => 'Test Region',
+            'city' => 'Test City',
+            'page_id' => null,
+            'page_url' => home_url('/?test=1'),
+            'is_landing' => 1,
+            'visited_at' => current_time('mysql', 1),
+        ]);
+        if ($wpdb->last_error) {
+            sut_log('Test visit insert failed: ' . $wpdb->last_error);
+            echo '<div class="error"><p>Test visit insert failed. Check logs.</p></div>';
+        } else {
+            echo '<div class="updated"><p>Test visit inserted.</p></div>';
+        }
+    }
+
+    echo '<form method="post" style="margin-bottom:12px;">';
+    echo '<button class="button" name="sut_test_visit" type="submit">Insert Test Visit</button> ';
+    echo '<button class="button" name="sut_clear_logs" type="submit">Clear Logs</button>';
+    echo '</form>';
+
+    $logs = $wpdb->get_results("SELECT * FROM {$table} ORDER BY created_at DESC LIMIT 200");
+
+    echo '<table class="widefat striped"><thead><tr><th>ID</th><th>Message</th><th>Time (GMT)</th></tr></thead><tbody>';
+    if ($logs) {
+        foreach ($logs as $log) {
+            echo '<tr><td>' . esc_html($log->id) . '</td><td>' . esc_html($log->message) . '</td><td>' . esc_html($log->created_at) . '</td></tr>';
+        }
+    } else {
+        echo '<tr><td colspan="3">No logs.</td></tr>';
+    }
+    echo '</tbody></table>';
+    echo '</div>';
+}
+
+/* =======================
+   Excel Export: COMMENTED OUT for now (kept for future)
+   =======================
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+function sut_export_excel_chunked($where, $params) {
+    // commented - placeholder
+}
+*/
+
+/* End of plugin file */
