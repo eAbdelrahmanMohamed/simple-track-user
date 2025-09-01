@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) exit;
 ------------------------- */
 define('SUT_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('SUT_PLUGIN_URL', plugin_dir_url(__FILE__));
-define('SUT_DB_VERSION', '3');
+define('SUT_DB_VERSION', '4');
 
 /* -------------------------
    Autoload (PhpSpreadsheet optional)
@@ -60,6 +60,8 @@ function sut_activate_plugin() {
         utm_campaign VARCHAR(100) NULL,
         utm_term VARCHAR(100) NULL,
         utm_content VARCHAR(100) NULL,
+        geo_lat DECIMAL(10,7) NULL,
+        geo_lng DECIMAL(10,7) NULL,
         is_session_landing TINYINT(1) DEFAULT 0,
         is_bot TINYINT(1) DEFAULT 0,
         bot_name VARCHAR(100) NULL,
@@ -76,6 +78,7 @@ function sut_activate_plugin() {
         INDEX page_hash_visit_idx (page_url_hash, visited_at),
         INDEX device_visit_idx (device_id, visited_at),
         INDEX session_visit_idx (session_id, visited_at),
+        INDEX geo_idx (geo_lat, geo_lng),
         INDEX is_bot_idx (is_bot)
     ) {$charset_collate};";
 
@@ -188,7 +191,13 @@ function sut_log($msg) {
    ======================= */
 add_action('wp_enqueue_scripts', 'sut_enqueue_device_js');
 function sut_enqueue_device_js() {
-    wp_enqueue_script('sut-track', SUT_PLUGIN_URL . 'includes/tracker.js', [], '1.0', true);
+    wp_enqueue_script('sut-track', SUT_PLUGIN_URL . 'includes/tracker.js', [], '1.1', true);
+    // Pass endpoint and nonce for geo updates
+    wp_localize_script('sut-track', 'SUT_TRACK', [
+        'geoEndpoint' => esc_url_raw(rest_url('sut/v1/geo')),
+        'nonce' => wp_create_nonce('wp_rest'),
+        'sessionKey' => 'sut_geo_sent',
+    ]);
 }
 
 /* -------------------------
@@ -391,6 +400,8 @@ $page_type = null;
     'utm_campaign' => $utm_campaign,
     'utm_term'   => $utm_term,
     'utm_content'=> $utm_content,
+    'geo_lat'    => null,
+    'geo_lng'    => null,
     'is_landing' => $is_landing,
     'is_bot'     => $is_bot,
     'bot_name'   => $bot_name,
@@ -414,6 +425,8 @@ $page_type = null;
     '%s', // utm_campaign
     '%s', // utm_term
     '%s', // utm_content
+    '%f', // geo_lat
+    '%f', // geo_lng
     '%d', // is_landing
     '%d', // is_bot
     '%s', // bot_name
@@ -837,6 +850,7 @@ function sut_page_troubleshoot() {
     $table = $wpdb->prefix . 'sut_logs';
 
     echo '<div class="wrap"><h1>Troubleshoot</h1>';
+    echo '<p><strong>Last daily aggregate:</strong> ' . esc_html(get_option('sut_last_aggregate_day', 'N/A')) . '</p>';
 
     if (isset($_POST['sut_clear_logs']) && current_user_can('manage_options') && check_admin_referer('sut_clear_logs')) {
         $wpdb->query("TRUNCATE TABLE {$table}");
@@ -999,5 +1013,32 @@ if (!function_exists('sut_export_xlsx_filtered')) {
         exit;
     }
 }
+
+/* =======================
+   REST: Receive precise geo (lat,lng) once per session
+   ======================= */
+add_action('rest_api_init', function() {
+    register_rest_route('sut/v1', '/geo', [
+        'methods'  => 'POST',
+        'permission_callback' => function($req){ return wp_verify_nonce($req->get_header('X-WP-Nonce'), 'wp_rest'); },
+        'callback' => function(WP_REST_Request $req) {
+            global $wpdb;
+            $table = $wpdb->prefix . 'user_visits';
+            $lat = floatval($req->get_param('lat'));
+            $lng = floatval($req->get_param('lng'));
+            $sid = isset($_COOKIE['sut_session_id']) ? sanitize_text_field($_COOKIE['sut_session_id']) : '';
+            if (!$sid) return new WP_REST_Response(['ok' => false], 200);
+            // Update the most recent visit for this session with geo
+            $row_id = $wpdb->get_var($wpdb->prepare("SELECT id FROM {$table} WHERE session_id=%s ORDER BY visited_at DESC LIMIT 1", $sid));
+            if ($row_id) {
+                $wpdb->update($table, [
+                    'geo_lat' => $lat,
+                    'geo_lng' => $lng,
+                ], ['id' => $row_id], ['%f','%f'], ['%d']);
+            }
+            return new WP_REST_Response(['ok' => true], 200);
+        }
+    ]);
+});
 
 /* End of plugin file */
