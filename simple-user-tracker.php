@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) exit;
 ------------------------- */
 define('SUT_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('SUT_PLUGIN_URL', plugin_dir_url(__FILE__));
-define('SUT_DB_VERSION', '2');
+define('SUT_DB_VERSION', '3');
 
 /* -------------------------
    Autoload (PhpSpreadsheet optional)
@@ -61,6 +61,8 @@ function sut_activate_plugin() {
         utm_term VARCHAR(100) NULL,
         utm_content VARCHAR(100) NULL,
         is_session_landing TINYINT(1) DEFAULT 0,
+        is_bot TINYINT(1) DEFAULT 0,
+        bot_name VARCHAR(100) NULL,
         is_landing TINYINT(1) DEFAULT 0,
         visited_at DATETIME(6) NOT NULL,
         PRIMARY KEY (id),
@@ -73,7 +75,8 @@ function sut_activate_plugin() {
         INDEX page_url_hash_idx (page_url_hash),
         INDEX page_hash_visit_idx (page_url_hash, visited_at),
         INDEX device_visit_idx (device_id, visited_at),
-        INDEX session_visit_idx (session_id, visited_at)
+        INDEX session_visit_idx (session_id, visited_at),
+        INDEX is_bot_idx (is_bot)
     ) {$charset_collate};";
 
     $sql2 = "CREATE TABLE {$logs} (
@@ -243,6 +246,9 @@ $page_type = null;
 
     $country = $region = $city = null;
     $referrer = isset($_SERVER['HTTP_REFERER']) ? esc_url_raw($_SERVER['HTTP_REFERER']) : null;
+    $user_agent = isset($_SERVER['HTTP_USER_AGENT']) ? sanitize_text_field($_SERVER['HTTP_USER_AGENT']) : '';
+    $is_bot = 0;
+    $bot_name = null;
 
     // UTM params
     $utm_source = isset($_GET['utm_source']) ? sanitize_text_field(wp_unslash($_GET['utm_source'])) : null;
@@ -308,6 +314,17 @@ $page_type = null;
         // Fallback to request URL
         $page_url = esc_url_raw(home_url($_SERVER['REQUEST_URI']));
     }
+    // Bot detection (basic UA patterns)
+    $bot_patterns = [
+        'googlebot','bingbot','yandexbot','duckduckbot','baiduspider','slurp','msnbot','facebookexternalhit',
+        'twitterbot','linkedinbot','embedly','quora link preview','pinterestbot','slackbot','discordbot',
+        'applebot','semrushbot','ahrefsbot','mj12bot','crawler','spider','bot'
+    ];
+    $ua_lc = strtolower($user_agent);
+    foreach ($bot_patterns as $pat) {
+        if (strpos($ua_lc, $pat) !== false) { $is_bot = 1; $bot_name = $pat; break; }
+    }
+
     // Location via ip-api with 24h cache; skip localhost/private ranges
     $is_public_ip = filter_var($ip, FILTER_VALIDATE_IP) && !in_array($ip, ['127.0.0.1', '::1', '0.0.0.0']);
     if ($is_public_ip) {
@@ -375,6 +392,8 @@ $page_type = null;
     'utm_term'   => $utm_term,
     'utm_content'=> $utm_content,
     'is_landing' => $is_landing,
+    'is_bot'     => $is_bot,
+    'bot_name'   => $bot_name,
     'is_session_landing' => $is_session_landing,
     'visited_at' => current_time('mysql', 1),
 ], [
@@ -396,6 +415,8 @@ $page_type = null;
     '%s', // utm_term
     '%s', // utm_content
     '%d', // is_landing
+    '%d', // is_bot
+    '%s', // bot_name
     '%d', // is_session_landing
     '%s'  // visited_at
 ]);
