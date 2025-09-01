@@ -334,6 +334,11 @@ $page_type = null;
         if (strpos($ua_lc, $pat) !== false) { $is_bot = 1; $bot_name = $pat; break; }
     }
 
+    // Skip bots entirely from tracking
+    if ($is_bot) {
+        return;
+    }
+
     // Location via ip-api with 24h cache; skip localhost/private ranges
     $is_public_ip = filter_var($ip, FILTER_VALIDATE_IP) && !in_array($ip, ['127.0.0.1', '::1', '0.0.0.0']);
     if ($is_public_ip) {
