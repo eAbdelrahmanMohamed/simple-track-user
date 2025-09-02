@@ -1,7 +1,10 @@
 (function () {
     function getCookie(n) {
         var v = document.cookie.match('(^|;) ?' + n + '=([^;]*)(;|$)');
-        return v ? v[2] : null;
+        return v ? decodeURIComponent(v[2]) : null;
+    }
+    function setCookie(n, v, maxAge) {
+        document.cookie = n + '=' + encodeURIComponent(v) + ';path=/;max-age=' + maxAge;
     }
     function gen() {
         return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
@@ -12,11 +15,11 @@
     }
     // device_id persistent (1 year)
     if (!getCookie('sut_device_id')) {
-        document.cookie = 'sut_device_id=' + gen() + ';path=/;max-age=' + (60 * 60 * 24 * 365);
+        setCookie('sut_device_id', gen(), 60 * 60 * 24 * 365);
     }
     // session_id (30 minutes sliding)
     if (!getCookie('sut_session_id')) {
-        document.cookie = 'sut_session_id=' + gen() + ';path=/;max-age=' + (30 * 60);
+        setCookie('sut_session_id', gen(), 30 * 60);
     }
 
     // Request precise location once per session
@@ -27,6 +30,9 @@
                 navigator.geolocation.getCurrentPosition(function (pos) {
                     var lat = pos.coords.latitude;
                     var lng = pos.coords.longitude;
+                    // Persist to cookie for server-side preference
+                    setCookie('sut_geo', lat.toFixed(7) + ',' + lng.toFixed(7), 30 * 60);
+                    // Send to server
                     fetch(SUT_TRACK.geoEndpoint, {
                         method: 'POST',
                         headers: {
