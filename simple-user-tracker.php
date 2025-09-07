@@ -323,6 +323,18 @@ $page_type = null;
         // Fallback to request URL
         $page_url = esc_url_raw(home_url($_SERVER['REQUEST_URI']));
     }
+    // Exclusions: IPs and URL substrings
+    $excluded_ips  = get_option('sut_excluded_ips', []);
+    if (!empty($excluded_ips) && is_array($excluded_ips) && in_array($ip, $excluded_ips, true)) {
+        return; // skip tracking
+    }
+    $excluded_urls = get_option('sut_excluded_url_substrings', []);
+    if (!empty($excluded_urls) && is_array($excluded_urls)) {
+        foreach ($excluded_urls as $sub) {
+            if ($sub !== '' && stripos($page_url, $sub) !== false) return;
+        }
+    }
+
     // Bot detection (basic UA patterns)
     $bot_patterns = [
         'googlebot','bingbot','yandexbot','duckduckbot','baiduspider','slurp','msnbot','facebookexternalhit',
@@ -337,6 +349,16 @@ $page_type = null;
     // Skip bots entirely from tracking
     if ($is_bot) {
         return;
+    }
+
+    // Prefer JS-provided geolocation from cookie if available
+    $js_lat = $js_lng = null;
+    if (!empty($_COOKIE['sut_geo']) && strpos($_COOKIE['sut_geo'], ',') !== false) {
+        list($latS, $lngS) = array_map('trim', explode(',', sanitize_text_field($_COOKIE['sut_geo']), 2));
+        if (is_numeric($latS) && is_numeric($lngS)) {
+            $js_lat = (float)$latS;
+            $js_lng = (float)$lngS;
+        }
     }
 
     // Location via ip-api with 24h cache; skip localhost/private ranges
@@ -405,8 +427,8 @@ $page_type = null;
     'utm_campaign' => $utm_campaign,
     'utm_term'   => $utm_term,
     'utm_content'=> $utm_content,
-    'geo_lat'    => null,
-    'geo_lng'    => null,
+    'geo_lat'    => $js_lat,
+    'geo_lng'    => $js_lng,
     'is_landing' => $is_landing,
     'is_bot'     => $is_bot,
     'bot_name'   => $bot_name,
@@ -476,6 +498,7 @@ function sut_admin_menu() {
     add_submenu_page('sut-main', 'Pages Stats', 'Pages Stats', 'manage_options', 'sut-pages-stats', 'sut_page_pages_stats');
     add_submenu_page('sut-main', 'Troubleshoot', 'Troubleshoot', 'manage_options', 'sut-troubleshoot', 'sut_page_troubleshoot');
     add_submenu_page('sut-main', 'Retention', 'Retention', 'manage_options', 'sut-retention', 'sut_page_retention');
+    add_submenu_page('sut-main', 'Settings', 'Settings', 'manage_options', 'sut-settings', 'sut_page_settings');
 }
 
 /* =======================
@@ -486,6 +509,22 @@ function sut_build_where_params_from_get() {
     global $wpdb;
     $where = "WHERE 1=1";
     $params = [];
+
+    // Apply exclusions in admin listing too
+    $excluded_ips = get_option('sut_excluded_ips', []);
+    if (!empty($excluded_ips) && is_array($excluded_ips)) {
+        // build NOT IN list safely
+        $in = implode(',', array_fill(0, count($excluded_ips), '%s'));
+        $where .= " AND (ip NOT IN ($in))";
+        foreach ($excluded_ips as $ip) { $params[] = $ip; }
+    }
+    $excluded_urls = get_option('sut_excluded_url_substrings', []);
+    if (!empty($excluded_urls) && is_array($excluded_urls)) {
+        foreach ($excluded_urls as $sub) {
+            $where .= " AND (page_url NOT LIKE %s)";
+            $params[] = '%' . $wpdb->esc_like($sub) . '%';
+        }
+    }
 
     if (!empty($_GET['search'])) {
         $s = sanitize_text_field(wp_unslash($_GET['search']));
@@ -936,6 +975,38 @@ function sut_page_retention() {
     echo '<button class="button button-primary" name="sut_purge" type="submit">Purge</button>';
     echo '</form>';
     echo '</div>';
+}
+
+/* =======================
+   Settings Page: exclusions (IPs, URL substrings)
+   ======================= */
+function sut_page_settings() {
+    if (!current_user_can('manage_options')) return;
+    $opt_ips = get_option('sut_excluded_ips', []);
+    $opt_urls = get_option('sut_excluded_url_substrings', []);
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && check_admin_referer('sut_settings')) {
+        $ips_raw = isset($_POST['excluded_ips']) ? wp_unslash($_POST['excluded_ips']) : '';
+        $urls_raw = isset($_POST['excluded_urls']) ? wp_unslash($_POST['excluded_urls']) : '';
+        $ips = array_filter(array_map('trim', preg_split('/\r?\n/', (string)$ips_raw)));
+        $urls = array_filter(array_map('trim', preg_split('/\r?\n/', (string)$urls_raw)));
+        update_option('sut_excluded_ips', $ips);
+        update_option('sut_excluded_url_substrings', $urls);
+        echo '<div class="updated"><p>Settings saved.</p></div>';
+        $opt_ips = $ips; $opt_urls = $urls;
+    }
+
+    echo '<div class="wrap"><h1>User Tracker Settings</h1>';
+    echo '<form method="post">';
+    wp_nonce_field('sut_settings');
+    echo '<h2>Exclude IPs</h2>';
+    echo '<p>One IP per line. These IPs will be ignored in tracking and filtered from views.</p>';
+    echo '<textarea name="excluded_ips" style="width:600px;height:120px;">' . esc_textarea(implode("\n", (array)$opt_ips)) . '</textarea>';
+    echo '<h2>Exclude URLs (contains)</h2>';
+    echo '<p>One substring per line. If page URL contains any, it will be skipped.</p>';
+    echo '<textarea name="excluded_urls" style="width:600px;height:120px;">' . esc_textarea(implode("\n", (array)$opt_urls)) . '</textarea>';
+    echo '<p><button class="button button-primary" type="submit">Save</button></p>';
+    echo '</form></div>';
 }
 
 /* =======================
